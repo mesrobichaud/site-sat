@@ -575,6 +575,9 @@ def _progress(total, enabled):
 # then looked up from one scan); a plain channel such as "C02" or "C13" gives a grey image.
 IMAGE_COMPOSITES: dict[str, tuple[tuple, str]] = {
     "true_color": (("C01", "C02", "C03"), "Day: what the eye sees, Rayleigh-corrected, 0.5 km"),
+    "true_color_reproduction": (("C01", "C02", "C03"),
+                                "Day: JMA colour-matrix true colour; more natural land colours "
+                                "(try adjust_image(gamma=1.5)); ~2× slower"),
     "natural_color": (("C02", "C03", "C05"), "Day: water clouds white, ice clouds/snow cyan"),
     "cloud_phase": (("C02", "C05", "C06"), "Day: liquid (white/yellow) vs ice (green/blue) tops"),
     "day_cloud_type": (("C02", "C04", "C05"), "Day: cloud type (cirrus, low, thick ice)"),
@@ -728,13 +731,58 @@ def fetch_images(lat, lon, start, end, composite="true_color", *, view_km=60, ra
     return img
 
 
+def adjust_image(img: xr.DataArray, saturation=1.0, contrast=1.0, gamma=1.0) -> xr.DataArray:
+    """Display tweaks for a picture from ``fetch_images`` (returns a new image; cache untouched).
+
+    saturation : >1 more colourful (scales each pixel's distance from its own grey level).
+    contrast   : >1 more contrast around mid-grey.
+    gamma      : >1 darkens mid-tones (``out = in ** gamma`` on 0..1), <1 brightens.
+    """
+    x = img.values.astype(np.float32) / 255.0
+    if x.shape[-1] >= 3 and saturation != 1.0:
+        rgb = x[..., :3]
+        grey = (rgb @ np.array([0.299, 0.587, 0.114], np.float32))[..., None]
+        x[..., :3] = grey + saturation * (rgb - grey)
+    if contrast != 1.0:
+        x = 0.5 + contrast * (x - 0.5)
+    x = np.clip(x, 0, 1)
+    if gamma != 1.0:
+        x = x ** gamma
+    out = img.copy(data=(x * 255 + 0.5).astype(np.uint8))
+    out.attrs["composite"] = img.attrs.get("composite", "") + (
+        f" (sat {saturation:g}, contrast {contrast:g}, gamma {gamma:g})")
+    return out
+
+
+def _scale_bar(ax, frac=1 / 6):
+    """Scale bar ~``frac`` of the map width, lower right, rounded to the nearest 5 km
+    (minimum 5 km). Assumes a metre-based projection centred on the point (the
+    azimuthal-equidistant maps used here)."""
+    import matplotlib.patheffects as pe
+
+    x0, x1, y0, y1 = ax.get_extent(crs=ax.projection)
+    width_km = (x1 - x0) / 1000
+    length = max(5, 5 * round(width_km * frac / 5))
+    pad_x, pad_y = 0.04 * (x1 - x0), 0.05 * (y1 - y0)
+    xe = x1 - pad_x
+    xs = xe - length * 1000
+    y = y0 + pad_y
+    outline = [pe.Stroke(linewidth=2.6, foreground="black"), pe.Normal()]
+    ax.plot([xs, xe], [y, y], color="white", lw=1.6, solid_capstyle="butt",
+            transform=ax.projection, path_effects=outline, zorder=6)
+    ax.text((xs + xe) / 2, y + 0.012 * (y1 - y0), f"{length:g} km", color="white", fontsize=8,
+            ha="center", va="bottom", transform=ax.projection, zorder=6,
+            path_effects=[pe.withStroke(linewidth=1.2, foreground="black")])
+
+
 def _image_projection(img):
     import cartopy.crs as ccrs
     return ccrs.AzimuthalEquidistant(central_longitude=img.attrs["center_lon"],
                                      central_latitude=img.attrs["center_lat"])
 
 
-def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlays=()):
+def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlays=(),
+               scale_bar=True):
     """Show one picture (``t`` = index or timestamp; default the latest scan).
 
     The native satellite-view image is warped onto a map centred on the point, so
@@ -743,6 +791,7 @@ def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlay
     overlays : flagged pixels to draw on top, each a dict like
         ``dict(mask=<bool DataArray from fetch() data>, color="red", label="hot", style="outline")``
         (see ``overlay_pixels``). The mask's scan nearest the picture's scan is used.
+    scale_bar : draw a km scale bar (~1/6 of the width) in the lower right.
     """
     import matplotlib.pyplot as plt
     import cartopy.crs as ccrs
@@ -774,6 +823,8 @@ def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlay
     # plot target arrow
     ax.plot(lon0, lat0, "+", color="red", ms=10, mew=1.5, transform=ccrs.PlateCarree())
     ax.set_extent([-half, half, -half, half], crs=crs)
+    if scale_bar:
+        _scale_bar(ax)
     handles = []
     for ov in overlays:
         ov = dict(ov)
@@ -789,7 +840,7 @@ def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlay
     return ax
 
 
-def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True, overlays=()):
+def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True, overlays=(), scale_bar=True):
     """Small multiples of ``n`` evenly spaced pictures (``overlays`` as in plot_image)."""
     import matplotlib.pyplot as plt
 
@@ -799,7 +850,7 @@ def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True, overlays=()):
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False,
                              subplot_kw={"projection": crs})
     for ax, i in zip(axes.flat, idx):
-        plot_image(img, int(i), ax=ax, coast=coast, overlays=overlays,
+        plot_image(img, int(i), ax=ax, coast=coast, overlays=overlays, scale_bar=scale_bar,
                    title=pd.Timestamp(img.time.values[i]).strftime("%Y-%m-%d %H:%M UTC"))
     for ax in axes.flat[len(idx):]:
         ax.set_visible(False)
@@ -959,7 +1010,8 @@ def flagged_pixels(mask: xr.DataArray, data: xr.Dataset | None = None, variables
 # The fixed part (file opens, HDF5 metadata, angle/LUT setup) was measured on a home
 # connection at a 60 km view / 14 km radius, where the area part is ~1 s. The per-pixel
 # rates are assumptions, not measurements, so large-area estimates are order-of-magnitude.
-_FIXED_SECONDS = {"true_color": 16, "natural_color": 16, "cloud_phase": 16, "C02": 7.5,
+_FIXED_SECONDS = {"true_color": 16, "true_color_reproduction": 28, "natural_color": 16,
+                  "cloud_phase": 16, "C02": 7.5,
                   "C13": 2.3, "colorized_ir_clouds": 2.3}
 _SECONDS_PER_FILE = 3          # fixed cost for anything else, per channel / product file
 _READ_S_PER_MPX = 2.0          # read + decompress + composite, per million native pixels
@@ -1287,7 +1339,7 @@ def map_projection(ds: xr.Dataset):
 
 
 def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None, cmap=None,
-               vmin=None, vmax=None, circle_km=None, overlays=()):
+               vmin=None, vmax=None, circle_km=None, overlays=(), scale_bar=True):
     """Map one scan of ``var`` on its native pixels. ``t`` is an integer index or a timestamp.
 
     ``var`` can be any variable you add yourself, e.g. ``ds["dT"] = ds.C07 - ds.C13``, or
@@ -1296,6 +1348,7 @@ def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None, c
     circle_km : radius of the circle drawn (default: the radius the data was fetched with;
                 0 for none).
     overlays : flagged pixels drawn on top, as in ``plot_image``.
+    scale_bar : draw a km scale bar (~1/6 of the width) in the lower right.
     """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -1334,6 +1387,8 @@ def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None, c
             pass
     pad = 1150 * r  # metres
     ax.set_extent([-pad, pad, -pad, pad], crs=map_projection(ds))
+    if scale_bar:
+        _scale_bar(ax)
     import matplotlib.ticker as mticker
     gl = ax.gridlines(draw_labels=True, lw=0.3, alpha=0.5, x_inline=False, y_inline=False,
                       rotate_labels=False)
