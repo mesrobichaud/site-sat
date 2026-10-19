@@ -1,0 +1,44 @@
+# Conda environment for goes_query / goes_area_query.ipynb.
+#
+#   conda env create -f environment.yml            # new env called "mapping"
+#   conda env update -n mapping -f environment.yml # add these packages to an existing env
+#   python -m ipykernel install --user --name mapping --display-name "Python 3 (mapping)"
+#
+# Lower bounds are the versions this code was tested with (Oct 2026).
+name: mapping
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+
+  # Satellite reading, calibration, composites
+  - satpy>=0.60
+  - pyresample>=1.35
+  - pyspectral>=0.14.3      # Rayleigh correction for true/natural colour
+  - pyorbital>=1.14         # sun/satellite angles
+  - trollimage>=1.29        # image enhancement
+
+  # Remote access to the NOAA S3 buckets and netCDF4/HDF5 reading
+  - s3fs>=2026.9
+  - fsspec>=2026.9
+  - h5netcdf>=1.8
+  - h5py>=3.16
+  - netcdf4>=1.7            # NetCDF output
+
+  # Arrays and data
+  - xarray>=2026.9
+  - dask>=2026.8
+  - numpy>=2.4
+  - pandas>=3.0
+
+  # Geometry, maps, plotting
+  - pyproj>=3.7
+  - cartopy>=0.26
+  - shapely>=2.2
+  - matplotlib>=3.10
+  - pillow>=12
+
+  # Notebook
+  - ipykernel>=7
+  - ipywidgets>=8           # tqdm progress bars in the notebook
+  - tqdm>=4.70
