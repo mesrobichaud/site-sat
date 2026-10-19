@@ -34,6 +34,19 @@ log = logging.getLogger(__name__)
 # Harmless: cartopy clipping coastlines to a small local-projection map.
 warnings.filterwarnings("ignore", message="invalid value encountered in create_collection",
                         category=RuntimeWarning)
+# Harmless: satpy's ABI reader picks dask chunks that don't line up with the files' HDF5
+# chunks; for the small crops read here that costs at most a few repeated chunk reads.
+warnings.filterwarnings("ignore", message="The specified chunks separate the stored chunks",
+                        category=UserWarning)
+
+
+def _fsfile(path, fs):
+    """satpy FSFile (moved to satpy.readers.core.remote in satpy 0.60)."""
+    try:
+        from satpy.readers.core.remote import FSFile
+    except ImportError:  # older satpy
+        from satpy.readers import FSFile
+    return FSFile(path, fs)
 
 EARTH_RADIUS_KM = 6371.0088
 KM_PER_DEG_LAT = 111.32
@@ -263,10 +276,9 @@ def _clean_attrs(attrs) -> dict:
 
 
 def _open_files(keys, mode, cache_dir):
-    from satpy.readers import FSFile
     fs = _s3()
     if mode == "stream":
-        return [FSFile(k, fs) for k in keys]
+        return [_fsfile(k, fs) for k in keys]
     paths = []
     for k in keys:
         local = Path(cache_dir) / k
@@ -293,9 +305,7 @@ def _extract_scan(keys, p: Product, datasets, lat, lon, radius_km, mode, cache_d
     try:
         full_area.get_array_indices_from_lonlat(lon, lat)
     except ValueError as err:
-        raise PointOutsideSector(
-            f"({lat}, {lon}) is outside this sector of {_bucket_from_key(keys[0])}. "
-            "Try sector='F', or another satellite (goes19 = GOES-East).") from err
+        raise PointOutsideSector(_outside_msg(lat, lon, keys[0])) from err
 
     margin_km = 1.5 * max(scn[d].attrs["area"].pixel_size_x for d in loaded) / 1000
     scn = scn.crop(ll_bbox=_ll_bbox(lat, lon, radius_km, margin_km))
@@ -330,13 +340,22 @@ def _bucket_from_key(key):
     return key.split("/", 1)[0]
 
 
+def _outside_msg(lat, lon, key):
+    bucket = _bucket_from_key(key)
+    other = {"noaa-goes18": "goes19 (GOES-East)", "noaa-goes17": "goes19 (GOES-East)",
+             "noaa-goes19": "goes18 (GOES-West)", "noaa-goes16": "goes18 (GOES-West)"}.get(bucket, "another satellite")
+    full_disk = "/ABI-L1b-RadF/" in key or "/ABI-L2-" in key and key.split("/")[1].endswith("F")
+    tip = f"Try {other}." if full_disk else f"Try sector='F', or {other}."
+    return f"({lat:.4f}, {lon:.4f}) is outside this sector of {bucket}. {tip}"
+
+
 # --------------------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------------------
 
 def fetch(product, lat, lon, radius_km, start, end, *, sector="C", satellite="goes18",
           datasets=None, mode="stream", cache_dir="data/raw", mask_outside=True,
-          workers=4, retries=3, progress=True) -> xr.Dataset:
+          cache="output/cache", workers=4, retries=3, progress=True) -> xr.Dataset:
     """Fetch every scan of ``product`` between ``start`` and ``end`` (UTC) for a circle.
 
     Parameters
@@ -353,6 +372,9 @@ def fetch(product, lat, lon, radius_km, start, end, *, sector="C", satellite="go
            files under ``cache_dir`` (re-runs are then offline).
     mask_outside : set pixels outside the radius to NaN (the ``in_radius`` coord is
                    always included either way).
+    cache : folder for the per-scan cache (default ``output/cache``). Scans already there
+            for the same satellite/product/location/radius/variables are loaded instead
+            of fetched; new scans are added. ``None`` disables it.
 
     Returns
     -------
@@ -365,11 +387,14 @@ def fetch(product, lat, lon, radius_km, start, end, *, sector="C", satellite="go
     if files.empty:
         raise FileNotFoundError(f"No {p.prefix}{sector[0]} files on {_bucket(satellite)} "
                                 f"between {start} and {end}")
-    scans = [g["key"].tolist() for _, g in files.groupby("start_time", sort=True)]
+    groups = list(files.groupby("start_time", sort=True))
+    scans = [g["key"].tolist() for _, g in groups]
 
-    frames = _run_scans(scans, lambda keys: _extract_scan(keys, p, datasets, lat, lon, radius_km,
-                                                          mode, cache_dir),
-                        workers, retries, progress)
+    frames = _cached_run(
+        scans, [t for t, _ in groups], _data_cache_dir(cache, p, sector, satellite, lat, lon,
+                                                       radius_km, datasets),
+        lambda keys: _extract_scan(keys, p, datasets, lat, lon, radius_km, mode, cache_dir),
+        workers, retries, progress, label=f"{p.prefix}{sector}")
 
     crs_wkt = frames[0].attrs["crs_wkt"]
     ds = xr.concat(frames, dim="time", join="outer", combine_attrs="override")
@@ -387,6 +412,83 @@ def fetch(product, lat, lon, radius_km, start, end, *, sector="C", satellite="go
         n_scans_failed=len(scans) - len(frames),
     )
     return ds
+
+
+# Per-scan cache --------------------------------------------------------------------------
+# One small NetCDF per processed scan under <cache>/v<N>/{data,images}/<query key>/.
+# Bump _CACHE_VERSION when per-scan processing changes so stale scans aren't reused.
+_CACHE_VERSION = 1
+
+
+def _data_cache_dir(cache, p, sector, satellite, lat, lon, radius_km, datasets):
+    if not cache:
+        return None
+    key = (f"{_bucket(satellite).replace('noaa-', '')}_{p.prefix}{sector}_{lat:.5f}_{lon:.5f}_"
+           f"r{radius_km:g}km_{'+'.join(datasets)}")
+    return Path(cache) / f"v{_CACHE_VERSION}" / "data" / key
+
+
+def _image_cache_dir(cache, composite, p, sector, satellite, lat, lon, view_km):
+    if not cache:
+        return None
+    key = (f"{_bucket(satellite).replace('noaa-', '')}_{composite}_{p.prefix}{sector}_"
+           f"{lat:.5f}_{lon:.5f}_v{view_km:g}km")
+    return Path(cache) / f"v{_CACHE_VERSION}" / "images" / key
+
+
+def _scan_stamp(t) -> str:
+    t = pd.Timestamp(t)
+    return f"{t:%Y%m%dT%H%M%S}{t.microsecond // 100000}"   # tenths, as in the file names
+
+
+def _cached_scan_times(cache_dir) -> set[str]:
+    if cache_dir is None or not cache_dir.exists():
+        return set()
+    return {f.stem for f in cache_dir.glob("*.nc")}
+
+
+def _save_scan(frame, path: Path):
+    ds = frame.to_dataset(name="image") if isinstance(frame, xr.DataArray) else frame
+    tmp = path.with_suffix(".part")
+    ds.to_netcdf(tmp, encoding={v: {"zlib": True, "complevel": 4} for v in ds.data_vars})
+    tmp.rename(path)
+
+
+def _load_scan(path: Path):
+    with xr.open_dataset(path) as ds:
+        ds = ds.load()
+    if "image" in ds.data_vars and len(ds.data_vars) == 1:
+        img = ds["image"]
+        img.attrs.update(ds.attrs)
+        return img
+    return ds
+
+
+def _cached_run(scans, scan_times, cache_dir, extract, workers, retries, progress, label):
+    """``_run_scans`` with a per-scan cache: load scans already cached, fetch and save the rest."""
+    have = _cached_scan_times(cache_dir)
+    frames, todo = [], []
+    for keys, t in zip(scans, scan_times):
+        stamp = _scan_stamp(t)
+        if stamp in have:
+            try:
+                frames.append(_load_scan(cache_dir / f"{stamp}.nc"))
+                continue
+            except Exception:  # unreadable / partial file: fetch it again
+                (cache_dir / f"{stamp}.nc").unlink(missing_ok=True)
+        todo.append(keys)
+    if frames:
+        print(f"{label}: {len(frames)} of {len(scans)} scans loaded from cache ({cache_dir})"
+              + (f"; fetching {len(todo)}" if todo else ""))
+    if todo:
+        new = _run_scans(todo, extract, workers, retries, progress)
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            for f in new:
+                # written here in the main thread: HDF5 writes aren't thread-safe
+                _save_scan(f, cache_dir / f"{_scan_stamp(f.time.values[0])}.nc")
+        frames += new
+    return sorted(frames, key=lambda d: d.time.values[0])
 
 
 def _run_scans(scans, extract, workers, retries, progress):
@@ -480,6 +582,8 @@ IMAGE_COMPOSITES: dict[str, tuple[tuple, str]] = {
     "colorized_ir_clouds": (("C13",), "Day & night: 10.3 µm IR, cold tops coloured"),
     "C13": (("C13",), "Day & night: 10.3 µm clean IR window, greyscale"),
     "C02": (("C02",), "Day: 0.64 µm red visible, 0.5 km, greyscale"),
+    "cira_fire_temperature": (("C05", "C06", "C07"),
+                              "Fires: red → orange → yellow as they get hotter; day & night"),
     "night_microphysics": (("C07", "C13", "C15"), "Night: low cloud and fog"),
     "fog": (("C11", "C14", "C15"), "Night fog / low stratus"),
     "airmass": (("C08", "C10", "C12", "C13"), "Air masses, jet streams (day & night)"),
@@ -502,8 +606,7 @@ def _composite_channels(composite, reader, keys_one_scan) -> tuple:
         return (composite,)
     if composite not in _COMPOSITE_CHANNELS:
         from satpy import Scene
-        from satpy.readers import FSFile
-        scn = Scene(reader=reader, filenames=[FSFile(k, _s3()) for k in keys_one_scan])
+        scn = Scene(reader=reader, filenames=[_fsfile(k, _s3()) for k in keys_one_scan])
         scn.load([composite], generate=False)
         _COMPOSITE_CHANNELS[composite] = tuple(sorted(str(k["name"]) for k in scn.keys()))
     return _COMPOSITE_CHANNELS[composite]
@@ -539,9 +642,7 @@ def _extract_image(keys, reader, composite, lat, lon, target, mode, cache_dir):
     try:
         scn[first].attrs["area"].get_array_indices_from_lonlat(lon, lat)
     except ValueError as err:
-        raise PointOutsideSector(
-            f"({lat}, {lon}) is outside this sector of {_bucket_from_key(keys[0])}. "
-            "Try sector='F', or another satellite (goes19 = GOES-East).") from err
+        raise PointOutsideSector(_outside_msg(lat, lon, keys[0])) from err
     view_km = max(target.width * target.pixel_size_x, target.height * target.pixel_size_y) / 2000
     scn = scn.crop(ll_bbox=_ll_bbox(lat, lon, view_km * 1.45, 6))   # 1.45: square corners
     # Build the composite on the native grid first: ABI true/natural colour are
@@ -557,6 +658,10 @@ def _extract_image(keys, reader, composite, lat, lon, target, mode, cache_dir):
     pixels = np.moveaxis(np.asarray(data.values), 0, -1)
     if re.fullmatch(r"C(0[7-9]|1[0-6])", composite):
         pixels = 255 - pixels  # IR convention: cold cloud tops white, warm ground dark
+    elif re.fullmatch(r"C0[1-6]", composite):
+        # Square-root stretch, the usual display for single visible bands (linear 0–100 %
+        # reflectance leaves clouds mid-grey).
+        pixels = (255 * np.sqrt(pixels / 255)).astype(np.uint8)
     area = target
     img = xr.DataArray(
         pixels[None],
@@ -572,7 +677,8 @@ def _extract_image(keys, reader, composite, lat, lon, target, mode, cache_dir):
 
 def fetch_images(lat, lon, start, end, composite="true_color", *, view_km=60, radius_km=None,
                  sector="C", satellite="goes18", source="imagery", mode="stream",
-                 cache_dir="data/raw", workers=4, retries=3, progress=True) -> xr.DataArray:
+                 cache_dir="data/raw", cache="output/cache", workers=4, retries=3,
+                 progress=True) -> xr.DataArray:
     """Satellite pictures around a point, one per scan, ready to display.
 
     Parameters
@@ -581,6 +687,7 @@ def fetch_images(lat, lon, start, end, composite="true_color", *, view_km=60, ra
     view_km : half-width of the picture around the point (the circle can be smaller).
     radius_km : optional circle to draw on the maps (your analysis radius).
     source : "imagery" (L2 CMIP, fastest) or "radiance" (L1b).
+    cache : per-scan cache folder (default ``output/cache``); ``None`` disables it.
 
     Returns
     -------
@@ -601,13 +708,16 @@ def fetch_images(lat, lon, start, end, composite="true_color", *, view_km=60, ra
     channels = _composite_channels(composite, p.reader,
                                    probe[probe.start_time == probe.start_time.iloc[0]].key.tolist())
     files = probe[probe.channel.isin([int(c[1:]) for c in channels])]
-    groups = files.groupby("start_time", sort=True)
-    scans = [g.key.tolist() for _, g in groups if len(g) == len(channels)]  # skip incomplete scans
+    groups = [(t, g) for t, g in files.groupby("start_time", sort=True)
+              if len(g) == len(channels)]                               # skip incomplete scans
+    scans = [g.key.tolist() for _, g in groups]
 
     target = _local_area(lat, lon, view_km, _image_resolution_m(channels))
-    frames = _run_scans(scans, lambda keys: _extract_image(keys, p.reader, composite, lat, lon,
-                                                           target, mode, cache_dir),
-                        workers, retries, progress)
+    frames = _cached_run(
+        scans, [t for t, _ in groups], _image_cache_dir(cache, composite, p, sector, satellite,
+                                                        lat, lon, view_km),
+        lambda keys: _extract_image(keys, p.reader, composite, lat, lon, target, mode, cache_dir),
+        workers, retries, progress, label=composite)
     img = xr.concat(frames, dim="time", join="outer", fill_value=0, combine_attrs="override")
     img.attrs.update(
         composite=composite, channels=" ".join(channels), satellite=_bucket(satellite),
@@ -624,11 +734,15 @@ def _image_projection(img):
                                      central_latitude=img.attrs["center_lat"])
 
 
-def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None):
+def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None, overlays=()):
     """Show one picture (``t`` = index or timestamp; default the latest scan).
 
     The native satellite-view image is warped onto a map centred on the point, so
     distances and the circle look right.
+
+    overlays : flagged pixels to draw on top, each a dict like
+        ``dict(mask=<bool DataArray from fetch() data>, color="red", label="hot", style="outline")``
+        (see ``overlay_pixels``). The mask's scan nearest the picture's scan is used.
     """
     import matplotlib.pyplot as plt
     import cartopy.crs as ccrs
@@ -656,8 +770,18 @@ def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None):
     if r is not None and np.isfinite(r):
         circle = Geodesic().circle(lon0, lat0, r * 1000, n_samples=180)
         ax.plot(circle[:, 0], circle[:, 1], color="red", lw=1.2, transform=ccrs.PlateCarree())
+    
+    # plot target arrow
     ax.plot(lon0, lat0, "+", color="red", ms=10, mew=1.5, transform=ccrs.PlateCarree())
     ax.set_extent([-half, half, -half, half], crs=crs)
+    handles = []
+    for ov in overlays:
+        ov = dict(ov)
+        n = overlay_pixels(ax, ov.pop("mask"), when=frame.time.values, **ov)
+        if ov.get("label"):
+            handles.append(_legend_handle(ov, n))
+    if handles:
+        ax.legend(handles=handles, loc="lower left", fontsize=7, framealpha=0.8)
     t0 = pd.Timestamp(frame.time.values).strftime("%Y-%m-%d %H:%M:%S")
     t1 = pd.Timestamp(frame.time_end.values).strftime("%H:%M:%S")
     ax.set_title(title or f"{img.attrs['satellite'].replace('noaa-', '').upper()} "
@@ -665,8 +789,8 @@ def plot_image(img: xr.DataArray, t=-1, ax=None, coast=True, title=None):
     return ax
 
 
-def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True):
-    """Small multiples of ``n`` evenly spaced pictures."""
+def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True, overlays=()):
+    """Small multiples of ``n`` evenly spaced pictures (``overlays`` as in plot_image)."""
     import matplotlib.pyplot as plt
 
     crs = _image_projection(img)
@@ -675,7 +799,7 @@ def plot_images(img: xr.DataArray, n=8, ncols=4, coast=True):
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows), squeeze=False,
                              subplot_kw={"projection": crs})
     for ax, i in zip(axes.flat, idx):
-        plot_image(img, int(i), ax=ax, coast=coast,
+        plot_image(img, int(i), ax=ax, coast=coast, overlays=overlays,
                    title=pd.Timestamp(img.time.values[i]).strftime("%Y-%m-%d %H:%M UTC"))
     for ax in axes.flat[len(idx):]:
         ax.set_visible(False)
@@ -690,19 +814,23 @@ def _image_stem(img):
             f"{a['center_lat']:.3f}_{a['center_lon']:.3f}_v{a['view_km']:g}km")
 
 
-def save_images(img: xr.DataArray, out_dir="output/images", gif=True, fps=4, dpi=110) -> Path:
-    """Write one annotated PNG per scan (named by scan start time) plus an animated GIF."""
+def save_images(img: xr.DataArray, out_dir="output/images", gif=True, fps=2, dpi=110,
+                overlays=(), suffix="") -> Path:
+    """Write one annotated PNG per scan (named by scan start time) plus an animated GIF.
+
+    ``overlays`` as in plot_image; ``suffix`` is appended to the folder name (e.g. "_flags").
+    """
     import matplotlib.pyplot as plt
     from PIL import Image
 
-    out = Path(out_dir) / _image_stem(img)
+    out = Path(out_dir) / (_image_stem(img) + suffix)
     out.mkdir(parents=True, exist_ok=True)
     crs = _image_projection(img)
     pngs = []
     for i in range(img.sizes["time"]):
         fig = plt.figure(figsize=(7, 7))
         ax = fig.add_subplot(projection=crs)
-        plot_image(img, i, ax=ax)
+        plot_image(img, i, ax=ax, overlays=overlays)
         path = out / f"{pd.Timestamp(img.time.values[i]):%Y%m%dT%H%M%S}Z.png"
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
@@ -712,6 +840,323 @@ def save_images(img: xr.DataArray, out_dir="output/images", gif=True, fps=4, dpi
         frames[0].save(out / "animation.gif", save_all=True, append_images=frames[1:],
                        duration=int(1000 / fps), loop=0)
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Flagged pixels: draw your own pixel masks (e.g. C07 - C13 tests) on the pictures
+# --------------------------------------------------------------------------------------
+
+# NOAA FDC fire-mask codes by confidence (temporally filtered codes are the 3x versions).
+_FIRE_CODES = {
+    "high": (10, 11, 13, 30, 31, 33),                     # good, saturated, high probability
+    "medium": (10, 11, 12, 13, 14, 30, 31, 32, 33, 34),   # + cloud-contaminated, medium
+    "low": (10, 11, 12, 13, 14, 15, 30, 31, 32, 33, 34, 35),
+}
+
+
+def fire_pixels(fire_mask: xr.DataArray, confidence="medium") -> xr.DataArray:
+    """Boolean mask of NOAA fire detections from the ``fire`` product's ``Mask`` variable.
+
+    confidence : "high" (good/saturated/high-probability fires), "medium" (+ cloud-
+                 contaminated and medium probability), or "low" (+ low probability).
+    """
+    return fire_mask.isin(_FIRE_CODES[confidence])
+
+
+def _corners(a):
+    """(ny, nx) pixel centres -> (ny+1, nx+1) pixel corners (linear extrapolation at edges)."""
+    a = np.pad(np.asarray(a, dtype=float), 1, mode="reflect", reflect_type="odd")
+    return 0.25 * (a[:-1, :-1] + a[1:, :-1] + a[:-1, 1:] + a[1:, 1:])
+
+
+def _select_scan(mask, when, tolerance):
+    if "time" not in mask.dims:
+        return mask
+    if when is None:
+        return mask.isel(time=-1)
+    try:
+        return mask.sel(time=np.datetime64(pd.Timestamp(when)), method="nearest",
+                        tolerance=pd.Timedelta(tolerance))
+    except KeyError:
+        return None
+
+
+def overlay_pixels(ax, mask: xr.DataArray, when=None, color="red", label=None, style="outline",
+                   lw=1.2, alpha=0.35, tolerance="3min") -> int:
+    """Draw the flagged pixels of ``mask`` on a map axis (e.g. one from ``plot_image``).
+
+    mask : boolean DataArray on the native grid with 2-D ``lat``/``lon`` coords, as you get
+           from any expression on ``fetch()`` output, e.g. ``(d.C07 - d.C13) > 20``.
+           With a ``time`` dim, the scan nearest ``when`` (within ``tolerance``) is drawn.
+    style : "outline" (true pixel footprint), "fill" (shaded footprint) or "dot" (centres).
+
+    Returns the number of pixels drawn.
+    """
+    from matplotlib.collections import PolyCollection
+    import cartopy.crs as ccrs
+
+    m = _select_scan(mask, when, tolerance)
+    if m is None:
+        return 0
+    if "lat" not in m.coords or "lon" not in m.coords:
+        raise ValueError("mask needs 2-D lat/lon coords: build it from fetch() output")
+    flags = np.asarray(m.values, dtype=float) > 0          # bool or 0/1; NaN -> not flagged
+    iy, ix = np.nonzero(flags)
+    if len(iy) == 0:
+        return 0
+    proj, pc = ax.projection, ccrs.PlateCarree()
+    if style == "dot":
+        xyz = proj.transform_points(pc, m.lon.values[iy, ix], m.lat.values[iy, ix])
+        ax.scatter(xyz[:, 0], xyz[:, 1], s=18, color=color, edgecolor="black", lw=0.5, zorder=5)
+        return len(iy)
+    clat, clon = _corners(m.lat.values), _corners(m.lon.values)
+    xyz = proj.transform_points(pc, clon, clat)
+    px, py = xyz[..., 0], xyz[..., 1]
+    verts = [[(px[j, i], py[j, i]), (px[j, i + 1], py[j, i + 1]),
+              (px[j + 1, i + 1], py[j + 1, i + 1]), (px[j + 1, i], py[j + 1, i])]
+             for j, i in zip(iy, ix)]
+    fill = style == "fill"
+    ax.add_collection(PolyCollection(verts, facecolors=color if fill else "none", edgecolors=color,
+                                     linewidths=lw, alpha=alpha if fill else 1.0, zorder=5))
+    return len(iy)
+
+
+def _legend_handle(ov, n):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    label, color = f"{ov['label']} ({n})", ov.get("color", "red")
+    if ov.get("style") == "dot":
+        return Line2D([], [], marker="o", ls="", color=color, markeredgecolor="black", label=label)
+    if ov.get("style") == "fill":
+        return Patch(facecolor=color, edgecolor=color, alpha=ov.get("alpha", 0.35), label=label)
+    return Patch(facecolor="none", edgecolor=color, label=label)
+
+
+def flagged_pixels(mask: xr.DataArray, data: xr.Dataset | None = None, variables=None) -> pd.DataFrame:
+    """Table of every flagged pixel: scan time, lat/lon, distance, and values from ``data``.
+
+    variables : which ``data`` variables to include (default: all of them).
+    """
+    m = mask if "time" in mask.dims else mask.expand_dims(time=[pd.NaT])
+    it, iy, ix = np.nonzero(np.asarray(m.values, dtype=float) > 0)
+    out = pd.DataFrame({"time": pd.to_datetime(m.time.values[it]),
+                        "lat": m.lat.values[iy, ix].astype(float).round(4),
+                        "lon": m.lon.values[iy, ix].astype(float).round(4)})
+    if "distance_km" in m.coords:
+        out["distance_km"] = m.distance_km.values[iy, ix].astype(float).round(1)
+    if data is not None:
+        for v in variables or list(data.data_vars):
+            vals = (data[v].sel(time=m.time) if "time" in data[v].dims else data[v]).values
+            out[v] = vals[it, iy, ix] if vals.ndim == 3 else vals[iy, ix]
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Quick check before a full run
+# --------------------------------------------------------------------------------------
+
+# Runtime model for quick_check: seconds per scan = fixed + area-dependent part.
+# The fixed part (file opens, HDF5 metadata, angle/LUT setup) was measured on a home
+# connection at a 60 km view / 14 km radius, where the area part is ~1 s. The per-pixel
+# rates are assumptions, not measurements, so large-area estimates are order-of-magnitude.
+_FIXED_SECONDS = {"true_color": 16, "natural_color": 16, "cloud_phase": 16, "C02": 7.5,
+                  "C13": 2.3, "colorized_ir_clouds": 2.3}
+_SECONDS_PER_FILE = 3          # fixed cost for anything else, per channel / product file
+_READ_S_PER_MPX = 2.0          # read + decompress + composite, per million native pixels
+_WARP_S_PER_MPX = 1.0          # bilinear warp + enhance, per million output pixel-bands
+_THREAD_SPEEDUP = 1.4          # measured gain of 4 worker threads over 1
+_NATIVE_KM = {"C01": 1.0, "C02": 0.5, "C03": 1.0, "C05": 1.0}   # other channels: 2 km
+
+
+def quick_check(lat, lon, radius_km, start, end, *, images=(), products=(), sector="C",
+                satellite="goes18", view_km=60, datasets=None, cache="output/cache",
+                preview=True):
+    """Sanity-check a query before running it. Reads 1–2 small files (~5–10 s).
+
+    Reports whether the point is inside the sector, the viewing geometry and real pixel
+    size there, sun elevation over the range, scan coverage/gaps and a rough runtime for
+    each image composite and product, and (``preview=True``) shows one picture of the
+    area with the circle drawn. Returns the coverage table.
+
+    Runtime estimates scale with the area handled: ``view_km`` for images (pixels read,
+    composited and warped) and ``radius_km`` for products, using the real pixel footprint
+    at the site. They assume a home connection and are rough, especially for big areas.
+    Scans already in the per-scan ``cache`` are counted (``cached`` column) and left out
+    of the estimate. ``datasets`` is the same per-product override dict passed to fetch().
+    """
+    from pyorbital.astronomy import sun_zenith_angle
+    from pyorbital.orbital import get_observer_look
+
+    t0, t1 = _utc(start), _utc(end)
+    bucket = _bucket(satellite)
+    print(f"Query: {bucket} sector {sector}, ({lat}, {lon}) r={radius_km} km, {t0} → {t1} UTC "
+          f"({(t1 - t0).total_seconds() / 3600:.1f} h)\n")
+
+    # --- coverage of every requested image / product (file listings only) ---------------
+    datasets = datasets or {}
+    rows, specs = [], []
+    for comp in images:
+        chans = _COMPOSITE_CHANNELS.get(comp) or ((comp,) if re.fullmatch(r"C\d{2}", comp) else None)
+        cdir = _image_cache_dir(cache, comp, _product("imagery"), sector, satellite, lat, lon, view_km)
+        rows.append(_coverage_row(f"image: {comp}", "imagery", chans, t0, t1, sector, satellite, cdir))
+        specs.append(("image", comp, chans))
+    for prod in products:
+        p = _product(prod)
+        dsets = tuple(datasets.get(prod) or p.datasets)
+        cdir = _data_cache_dir(cache, p, sector, satellite, lat, lon, radius_km, dsets)
+        rows.append(_coverage_row(f"product: {prod}", prod, dsets if p.per_channel else None,
+                                  t0, t1, sector, satellite, cdir))
+        specs.append(("product", prod, dsets))
+    table = pd.DataFrame(rows).set_index("item") if rows else pd.DataFrame()
+
+    # --- geometry from one C13 scan (2 km, ~4 MB file, streamed) ------------------------
+    probe = list_files("imagery", t0, t1, sector, satellite, datasets=["C13"])
+    if probe.empty:
+        print("✗ No ABI scans in this range. Check the dates (UTC), satellite and sector; "
+              "files appear in the bucket a few minutes after each scan.")
+        return table
+    mid = t0 + (t1 - t0) / 2
+    ts = probe.start_time.iloc[int((probe.start_time - mid).abs().argmin())]   # scan nearest mid-range
+    try:
+        g = fetch("imagery", lat, lon, radius_km, ts, ts, sector=sector, satellite=satellite,
+                  datasets=["C13"], cache=None, progress=False)
+    except PointOutsideSector as err:
+        print(f"✗ {err}")
+        return table
+    lon_0 = _crs_param(g.attrs["crs_wkt"], "lon_0")
+    h_km = _crs_param(g.attrs["crs_wkt"], "h") / 1000
+    _, elev = get_observer_look(np.array([lon_0]), np.array([0.0]), np.array([h_km]),
+                                ts.to_pydatetime(), np.array([lon]), np.array([lat]), np.array([0.0]))
+    vza = 90 - float(elev[0])
+    dx_km, dy_km = _pixel_footprint_km(g)
+    n_in = int(g.in_radius.sum())
+    print(f"✓ Point is inside the {sector} sector (sub-satellite longitude {lon_0:.1f}°).")
+    print(f"  Viewing zenith angle {vza:.0f}° "
+          f"{'(good)' if vza < 55 else '(oblique: pixels stretched, parallax large)' if vza < 70 else '(very oblique: consider the other satellite)'}.")
+    print(f"  Actual pixel size here: 2 km IR ≈ {dx_km:.1f} × {dy_km:.1f} km "
+          f"(0.5 km visible ≈ {dx_km / 4:.2f} × {dy_km / 4:.2f} km).")
+    print(f"  {n_in} IR pixels (~{n_in * 16} visible C02 pixels) fall inside the {radius_km} km circle.")
+    print(f"  Parallax: a cloud top at h km appears ~{np.tan(np.radians(vza)):.1f}·h km "
+          f"away from the satellite.")
+
+    # --- sun ------------------------------------------------------------------------------
+    times = pd.date_range(t0, t1, periods=5)
+    sun_elev = [90 - float(sun_zenith_angle(t.to_pydatetime(), lon, lat)) for t in times]
+    lo, hi = min(sun_elev), max(sun_elev)
+    print(f"\n  Sun elevation over the range: {lo:.0f}° … {hi:.0f}°", end=" ")
+    if hi < 0:
+        print("→ night: visible composites (true_color, C02, …) will be black; use IR "
+              "(C13, colorized_ir_clouds, night_microphysics, fog).")
+    elif lo < 10:
+        print("→ partly night / low sun: visible composites will be dark or black for part of the range.")
+    else:
+        print("→ daylight throughout.")
+
+    if len(table):
+        _add_estimates(table, specs, view_km, radius_km, (dx_km, dy_km))
+        total = table["est_minutes"].sum()
+        n_cached, n_scans = int(table.cached.sum()), int(table.scans.sum())
+        cached_note = f"; {n_cached} of {n_scans} scans already cached" if n_cached else ""
+        print(f"\nEstimated full run: ~{total:.0f} min for images ±{view_km} km and products "
+              f"r={radius_km} km (rough; scales with area, network-dependent{cached_note}).")
+        big = table[table.image_mpx > 10]
+        for item in big.index:
+            r = big.loc[item]
+            print(f"⚠ {item}: {r.image_px} px per scan ({r.image_mpx:.0f} Mpx, "
+                  f"~{r.image_mpx * r.scans / 1000:.1f} GB for all scans in memory). Slow, and the "
+                  f"{radius_km} km circle is a speck at this size; consider a smaller view_km.")
+        missing = table[table.scans == 0]
+        for item in missing.index:
+            print(f"✗ {item}: {missing.loc[item, 'note']}")
+
+    if preview:
+        import matplotlib.pyplot as plt
+        comp = "C02" if sun_elevation_ok(ts, lon, lat) else "C13"
+        img = fetch_images(lat, lon, ts, ts, comp, view_km=view_km, radius_km=radius_km,
+                           sector=sector, satellite=satellite, cache=None, progress=False)
+        plot_image(img, 0, title=f"Preview {comp}  {ts:%Y-%m-%d %H:%M} UTC  (view ±{view_km} km)")
+        plt.show()
+    return table
+
+
+def sun_elevation_ok(t, lon, lat, min_elev=20) -> bool:
+    from pyorbital.astronomy import sun_zenith_angle
+    return 90 - float(sun_zenith_angle(pd.Timestamp(t).to_pydatetime(), lon, lat)) >= min_elev
+
+
+def _coverage_row(item, product, channels, t0, t1, sector, satellite, cache_dir=None):
+    row = dict(item=item, scans=0, cached=0, files=0, first_scan=pd.NaT, last_scan=pd.NaT,
+               max_gap_min=np.nan, full_file_mb=0.0, note="")
+    try:
+        datasets = list(channels) if channels else None
+        files = list_files(product, t0, t1, sector, satellite, datasets=datasets)
+    except (ValueError, KeyError) as err:
+        row["note"] = str(err)
+        return row
+    if files.empty:
+        row["note"] = "no files in this range"
+        return row
+    scans = np.sort(files.start_time.unique())
+    gaps = np.diff(scans) / np.timedelta64(1, "m") if len(scans) > 1 else np.array([0.0])
+    if channels is None and product == "imagery":
+        row["note"] = "channels unknown until run (+20–30 s lookup)"
+    have = _cached_scan_times(cache_dir)
+    row.update(scans=len(scans), cached=sum(_scan_stamp(s) in have for s in scans),
+               files=len(files), first_scan=pd.Timestamp(scans[0]),
+               last_scan=pd.Timestamp(scans[-1]), max_gap_min=round(float(gaps.max()), 1),
+               full_file_mb=round(files.size_mb.sum(), 1))
+    return row
+
+
+def _add_estimates(table, specs, view_km, radius_km, footprint_2km):
+    """Fill est_s_per_scan / est_minutes / image size columns (see _FIXED_SECONDS)."""
+    fx, fy = footprint_2km                    # ground size of a nominal 2 km pixel here
+    est, mins, px, mpx = [], [], [], []
+    for (kind, name, chans), (_, row) in zip(specs, table.iterrows()):
+        files_per_scan = row.files / row.scans if row.scans else 0
+        fixed = _FIXED_SECONDS.get(name, _SECONDS_PER_FILE * files_per_scan)
+        if kind == "image":
+            chans = chans or ("C02", "C13")   # unknown composite: guess a mix
+            side = 2 * view_km * 1.45 + 12    # crop box incl. corner/margin padding (km)
+            native = sum(side ** 2 / (fx * fy * (_NATIVE_KM.get(c, 2.0) / 2) ** 2) for c in chans)
+            res_km = _image_resolution_m(chans) / 1000
+            n = int(round(2 * view_km / res_km))
+            bands = 1 if re.fullmatch(r"C\d{2}", name) else 3
+            out = n * n * bands
+            px.append(f"{n}×{n}")
+        else:
+            p = _product(name)
+            res_km = float(re.split(r"[-–]", p.resolution_km)[0])
+            side = 2 * radius_km + 3 * res_km * max(fx, fy) / 2
+            native = side ** 2 / (fx * fy * (res_km / 2) ** 2) * len(chans or p.datasets)
+            out = 0
+            px.append("")
+        sec = fixed + native / 1e6 * _READ_S_PER_MPX + out / 1e6 * _WARP_S_PER_MPX
+        est.append(round(sec, 1))
+        mins.append(round((row.scans - row.cached) * sec / _THREAD_SPEEDUP / 60, 1))
+        mpx.append(round(out / 1e6, 1))
+    table["image_px"] = px
+    table["image_mpx"] = mpx
+    table["est_s_per_scan"] = est
+    table["est_minutes"] = mins
+
+
+def _crs_param(crs_wkt, name):
+    from pyproj import CRS
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)   # "lose projection information": fine for geos
+        return float(CRS.from_wkt(crs_wkt).to_dict()[name])
+
+
+def _pixel_footprint_km(ds):
+    """Ground distance between neighbouring pixel centres at the pixel nearest the centre."""
+    iy, ix = np.unravel_index(np.nanargmin(ds.distance_km.values), ds.distance_km.shape)
+    iy = min(max(iy, 0), ds.sizes["y"] - 2)
+    ix = min(max(ix, 0), ds.sizes["x"] - 2)
+    lat, lon = ds.lat.values, ds.lon.values
+    dx = haversine_km(lat[iy, ix], lon[iy, ix], lat[iy, ix + 1], lon[iy, ix + 1])
+    dy = haversine_km(lat[iy, ix], lon[iy, ix], lat[iy + 1, ix], lon[iy + 1, ix])
+    return float(dx), float(dy)
 
 
 # --------------------------------------------------------------------------------------
@@ -786,6 +1231,32 @@ def save(ds: xr.Dataset, out_dir="output", stem=None) -> dict[str, Path]:
 # Plotting
 # --------------------------------------------------------------------------------------
 
+def make_rgb(ds: xr.Dataset, red, green, blue) -> xr.DataArray:
+    """Build an RGB from three variables on the native grid, for ``plot_frame``.
+
+    Each channel is ``(variable, min, max)`` or ``(variable, min, max, gamma)``: values are
+    scaled linearly from min..max to 0..1 (clipped), then raised to ``1/gamma`` (satpy's
+    convention). Variables can be anything in ``ds``, including ones you derived.
+    Returns a float DataArray (time, y, x, band) in 0..1 with ds's lat/lon coords.
+    """
+    chans = []
+    for name, spec in zip("RGB", (red, green, blue)):
+        var, lo, hi, *g = spec
+        x = ((ds[var] - lo) / (hi - lo)).clip(0, 1) ** (1.0 / (g[0] if g else 1.0))
+        chans.append(x.fillna(0).expand_dims(band=[name]))
+    out = xr.concat(chans, dim="band").transpose(..., "band")
+    out.attrs = {"long_name": "RGB " + "/".join(str(s[0]) for s in (red, green, blue))}
+    return out
+
+
+def fire_temperature_rgb(ds: xr.Dataset) -> xr.DataArray:
+    """CIRA Fire Temperature RGB (same recipe as satpy's ``cira_fire_temperature``) from
+    C07, C06, C05 on the native grid: small/cool fires red, hotter orange-yellow, the most
+    intense near white; clouds blue/white. Fetch ``imagery`` with ``["C05", "C06", "C07"]``.
+    """
+    return make_rgb(ds, red=("C07", 273.15, 333.15, 0.4), green=("C06", 0, 100), blue=("C05", 0, 75))
+
+
 def _style(da):
     """(cmap, norm, colorbar ticks, tick labels) — discrete for flag variables."""
     import matplotlib.colors as mcolors
@@ -815,8 +1286,17 @@ def map_projection(ds: xr.Dataset):
                                      central_latitude=ds.attrs["center_lat"])
 
 
-def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None):
-    """Map one scan of ``var``. ``t`` is an integer index or a timestamp."""
+def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None, cmap=None,
+               vmin=None, vmax=None, circle_km=None, overlays=()):
+    """Map one scan of ``var`` on its native pixels. ``t`` is an integer index or a timestamp.
+
+    ``var`` can be any variable you add yourself, e.g. ``ds["dT"] = ds.C07 - ds.C13``, or
+    an RGB from ``make_rgb`` / ``fire_temperature_rgb`` (drawn as colours, no colour bar).
+    cmap, vmin, vmax : colour scale (a fixed vmin/vmax makes scans comparable).
+    circle_km : radius of the circle drawn (default: the radius the data was fetched with;
+                0 for none).
+    overlays : flagged pixels drawn on top, as in ``plot_image``.
+    """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
     import matplotlib.pyplot as plt
@@ -825,13 +1305,26 @@ def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None):
     da = ds[var].isel(time=t) if isinstance(t, (int, np.integer)) else ds[var].sel(time=t, method="nearest")
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 5.5), subplot_kw={"projection": map_projection(ds)})
-    cmap, norm, ticks, labels = _style(da)
-    m = ax.pcolormesh(ds.lon, ds.lat, da, cmap=cmap, norm=norm, shading="nearest",
-                      transform=ccrs.PlateCarree())
+    is_rgb = "band" in da.dims
+    if is_rgb:   # e.g. from make_rgb / fire_temperature_rgb: values 0..1, drawn as colours
+        m = ax.pcolormesh(ds.lon, ds.lat, da.transpose("y", "x", "band").values.clip(0, 1),
+                          shading="nearest", transform=ccrs.PlateCarree())
+    else:
+        style_cmap, norm, ticks, labels = _style(da)
+        if cmap is not None:
+            style_cmap, norm, ticks = cmap, None, None
+        m = ax.pcolormesh(ds.lon, ds.lat, da, cmap=style_cmap, norm=norm, shading="nearest",
+                          transform=ccrs.PlateCarree(),
+                          **({} if norm is not None else {"vmin": vmin, "vmax": vmax}))
     lat0, lon0, r = ds.attrs["center_lat"], ds.attrs["center_lon"], ds.attrs["radius_km"]
-    circle = Geodesic().circle(lon0, lat0, r * 1000, n_samples=180)
-    ax.plot(circle[:, 0], circle[:, 1], color="tab:red", lw=1.2, transform=ccrs.PlateCarree())
-    ax.plot(lon0, lat0, "+", color="tab:red", ms=10, transform=ccrs.PlateCarree())
+    rc = r if circle_km is None else circle_km
+    if rc:
+        circle = Geodesic().circle(lon0, lat0, rc * 1000, n_samples=180)
+        ax.plot(circle[:, 0], circle[:, 1], color="tab:red", lw=1.2, transform=ccrs.PlateCarree())
+    
+    # Plot +
+    #ax.plot(lon0, lat0, "+", color="tab:red", ms=10, transform=ccrs.PlateCarree())
+    
     if coast:
         try:
             ax.add_feature(cfeature.COASTLINE.with_scale("10m"), lw=0.6, edgecolor="orange")
@@ -847,13 +1340,22 @@ def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None):
     gl.top_labels = gl.right_labels = False
     gl.xlocator, gl.ylocator = mticker.MaxNLocator(4), mticker.MaxNLocator(4)
     gl.xlabel_style = gl.ylabel_style = {"size": 7}
-    cb = plt.colorbar(m, ax=ax, shrink=0.8, pad=0.08)
-    if ticks is not None:
-        cb.set_ticks(ticks)
-        cb.set_ticklabels([s.replace("_", " ") for s in labels], fontsize=7)
-    else:
-        units = da.attrs.get("units", "")
-        cb.set_label(f"{var} [{units}]" if units not in ("", "1") else var)
+    handles = []
+    for ov in overlays:
+        ov = dict(ov)
+        n = overlay_pixels(ax, ov.pop("mask"), when=da.time.values, **ov)
+        if ov.get("label"):
+            handles.append(_legend_handle(ov, n))
+    if handles:
+        ax.legend(handles=handles, loc="lower left", fontsize=7, framealpha=0.8)
+    if not is_rgb:
+        cb = plt.colorbar(m, ax=ax, shrink=0.8, pad=0.08)
+        if ticks is not None:
+            cb.set_ticks(ticks)
+            cb.set_ticklabels([s.replace("_", " ") for s in labels], fontsize=7)
+        else:
+            units = da.attrs.get("units", "")
+            cb.set_label(f"{var} [{units}]" if units not in ("", "1") else var)
     t0 = pd.Timestamp(da.time.values).strftime("%Y-%m-%d %H:%M:%S")
     t1 = pd.Timestamp(da.time_end.values).strftime("%H:%M:%S")
     ax.set_title(title or f"{ds.attrs['satellite'].replace('noaa-', '').upper()} {ds.attrs['product']} "
@@ -861,8 +1363,8 @@ def plot_frame(ds: xr.Dataset, var: str, t=0, ax=None, coast=True, title=None):
     return ax
 
 
-def plot_frames(ds: xr.Dataset, var: str, n=12, ncols=4, coast=True):
-    """Small multiples of ``n`` evenly spaced scans."""
+def plot_frames(ds: xr.Dataset, var: str, n=12, ncols=4, coast=True, **kwargs):
+    """Small multiples of ``n`` evenly spaced scans (``kwargs`` go to plot_frame)."""
     import matplotlib.pyplot as plt
 
     idx = np.unique(np.linspace(0, ds.sizes["time"] - 1, min(n, ds.sizes["time"])).round().astype(int))
@@ -870,7 +1372,7 @@ def plot_frames(ds: xr.Dataset, var: str, n=12, ncols=4, coast=True):
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.8 * nrows), squeeze=False,
                              subplot_kw={"projection": map_projection(ds)})
     for ax, i in zip(axes.flat, idx):
-        plot_frame(ds, var, int(i), ax=ax, coast=coast,
+        plot_frame(ds, var, int(i), ax=ax, coast=coast, **kwargs,
                    title=pd.Timestamp(ds.time.values[i]).strftime("%Y-%m-%d %H:%M:%S UTC"))
     for ax in axes.flat[len(idx):]:
         ax.set_visible(False)
